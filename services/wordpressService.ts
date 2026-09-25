@@ -1,27 +1,61 @@
-
 import { WPSettings, WPPostResponse, WPCategory, WPSite } from "../types";
 
 const getBaseUrl = (url: string) => url.endsWith('/') ? url.slice(0, -1) : url;
 
-const wpProxy = async (site: WPSite, path: string, method: string = 'GET', data?: any, params?: any) => {
+// Safe utf-8 compatible Base64 encoder for browser
+const getBasicAuthHeader = (username: string, appPassword: string): string => {
+  const cleanUsername = username.trim();
+  const cleanPassword = appPassword.replace(/\s+/g, ' ').trim();
+  try {
+    return `Basic ${btoa(unescape(encodeURIComponent(`${cleanUsername}:${cleanPassword}`)))}`;
+  } catch (e) {
+    return `Basic ${btoa(`${cleanUsername}:${cleanPassword}`)}`;
+  }
+};
+
+/**
+ * Direct WordPress REST API request from client-side browser
+ */
+const wpRequest = async (site: WPSite, path: string, method: string = 'GET', data?: any, params?: any) => {
   const baseUrl = getBaseUrl(site.url);
-  const response = await fetch('/api/wp-proxy', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json'
-    },
-    credentials: 'include', // Important for AI Studio iframe context
-    body: JSON.stringify({
-      url: `${baseUrl}${path}`,
-      method,
-      auth: {
-        username: site.username,
-        appPassword: site.appPassword
-      },
-      data,
-      params
-    })
-  });
+  let fullUrl = `${baseUrl}${path}`;
+
+  if (params && Object.keys(params).length > 0) {
+    const searchParams = new URLSearchParams();
+    for (const [k, v] of Object.entries(params)) {
+      if (v !== undefined && v !== null) {
+        searchParams.append(k, String(v));
+      }
+    }
+    const sep = fullUrl.includes('?') ? '&' : '?';
+    fullUrl = `${fullUrl}${sep}${searchParams.toString()}`;
+  }
+
+  const authHeader = getBasicAuthHeader(site.username, site.appPassword);
+  const headers: Record<string, string> = {
+    'Authorization': authHeader,
+    'Accept': 'application/json'
+  };
+
+  const reqInit: RequestInit = {
+    method,
+    headers
+  };
+
+  if (data && (method === 'POST' || method === 'PUT' || method === 'PATCH')) {
+    headers['Content-Type'] = 'application/json';
+    reqInit.body = JSON.stringify(data);
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(fullUrl, reqInit);
+  } catch (netErr: any) {
+    console.error("WordPress Direct Request Network/CORS Error:", netErr);
+    throw new Error(
+      `WordPress-এ কানেক্ট করা যাচ্ছে না (${netErr.message || 'CORS / Network Error'})। আপনার ওয়ার্ডপ্রেস সাইটটি ব্রাউজার থেকে সরাসরি রিকোয়েস্ট ব্লক করছে। দয়া করে ওয়ার্ডপ্রেস সাইটের functions.php-তে CORS হেডার অ্যালাউ করুন অথবা Cloudflare/Wordfence-এ REST API এক্সেস দিন।`
+    );
+  }
 
   const responseText = await response.text();
   
@@ -39,11 +73,11 @@ const wpProxy = async (site: WPSite, path: string, method: string = 'GET', data?
   }
 
   if (!response.ok) {
-    let errorMsg = responseData?.message || `WordPress API failed: ${response.statusText}`;
+    let errorMsg = responseData?.message || `WordPress API failed: ${response.statusText} (${response.status})`;
     const errorCode = responseData?.code || 'unknown_error';
     
     if (response.status === 401 || response.status === 403) {
-      errorMsg = `পাবলিশ করতে সমস্যা হচ্ছে (Permission Denied)। আপনার ওয়ার্ডপ্রেস ইউজার রোল (Editor/Admin) এবং অ্যাপ্লিকেশন পাসওয়ার্ড চেক করুন। যদি সব ঠিক থাকে, তবে অ্যাপটি একটি নতুন ট্যাবে (New Tab) ওপেন করে চেষ্টা করুন।`;
+      errorMsg = `পাবলিশ করতে সমস্যা হচ্ছে (Permission Denied: HTTP ${response.status})। আপনার ওয়ার্ডপ্রেস ইউজার রোল (Editor/Admin) এবং Application Password চেক করুন।`;
     } else if (response.status === 400) {
       errorMsg = `পাবলিশ করতে সমস্যা হচ্ছে (Bad Request: ${errorCode})। ${responseData?.message || ''}`;
     }
@@ -70,14 +104,15 @@ const wpProxy = async (site: WPSite, path: string, method: string = 'GET', data?
 };
 
 export const fetchCategories = async (site: WPSite): Promise<WPCategory[]> => {
-  return wpProxy(site, '/wp-json/wp/v2/categories?per_page=100');
+  return wpRequest(site, '/wp-json/wp/v2/categories?per_page=100');
 };
 
 export const fetchRecentPostsByCategory = async (site: WPSite, categoryId: number, count: number = 2): Promise<{title: string, link: string}[]> => {
-  const posts = await wpProxy(site, `/wp-json/wp/v2/posts?categories=${categoryId}&per_page=${count}&status=publish`);
+  const posts = await wpRequest(site, `/wp-json/wp/v2/posts?categories=${categoryId}&per_page=${count}&status=publish`);
+  if (!Array.isArray(posts)) return [];
   return posts.map((p: any) => ({
-    title: p.title.rendered,
-    link: p.link
+    title: p.title?.rendered || '',
+    link: p.link || ''
   }));
 };
 
@@ -88,26 +123,39 @@ export interface MediaMetadata {
   description: string;
 }
 
-// Media upload is tricky via proxy because of multipart. 
-// Let's see if we can just use direct fetch for media or if we need to proxy that too.
-// Actually, let's try to proxy it as well but we might need a different route for multipart.
+/**
+ * Direct client-side WordPress Media Upload using FormData
+ */
 export const uploadMedia = async (site: WPSite, file: File, metadata: MediaMetadata): Promise<number> => {
   const baseUrl = getBaseUrl(site.url);
-  const formData = new FormData();
-  formData.append('file', file);
-  formData.append('url', `${baseUrl}/wp-json/wp/v2/media`);
-  formData.append('username', site.username);
-  formData.append('appPassword', site.appPassword);
-  formData.append('title', metadata.title);
-  formData.append('alt_text', metadata.alt_text);
-  formData.append('caption', metadata.caption);
-  formData.append('description', metadata.description);
+  const mediaUrl = `${baseUrl}/wp-json/wp/v2/media`;
 
-  const response = await fetch('/api/wp-media-proxy', {
-    method: 'POST',
-    credentials: 'include', // Important for AI Studio iframe context
-    body: formData
-  });
+  const authHeader = getBasicAuthHeader(site.username, site.appPassword);
+
+  const formData = new FormData();
+  formData.append('file', file, file.name);
+  if (metadata.title) formData.append('title', metadata.title);
+  if (metadata.alt_text) formData.append('alt_text', metadata.alt_text);
+  if (metadata.caption) formData.append('caption', metadata.caption);
+  if (metadata.description) formData.append('description', metadata.description);
+
+  let response: Response;
+  try {
+    response = await fetch(mediaUrl, {
+      method: 'POST',
+      headers: {
+        'Authorization': authHeader,
+        'Accept': 'application/json'
+        // Browser sets Content-Type multipart boundary automatically
+      },
+      body: formData
+    });
+  } catch (netErr: any) {
+    console.error("WP Media Upload Network/CORS Error:", netErr);
+    throw new Error(
+      `ইমেজ আপলোড করতে সমস্যা হয়েছে (${netErr.message || 'CORS / Network Error'})। আপনার ওয়ার্ডপ্রেস সাইট সম্ভবত ব্রাউজার থেকে ফাইল আপলোড ব্লক করছে।`
+    );
+  }
 
   const responseText = await response.text();
 
@@ -120,17 +168,14 @@ export const uploadMedia = async (site: WPSite, file: File, metadata: MediaMetad
 
   if (!responseData && typeof responseText === 'string') {
     if (responseText.includes('<title>Cookie check</title>') || responseText.includes('Wordfence') || responseText.includes('cloudflare')) {
-      throw new Error("আপনার ওয়েবসাইটের সিকিউরিটি প্লাগিন (যেমন: Wordfence বা Cloudflare) API রিকোয়েস্ট ব্লক করছে। দয়া করে প্লাগিন সেটিংসে REST API বা এই অ্যাপের অ্যাক্সেস অ্যালাউ করুন।");
+      throw new Error("আপনার ওয়েবসাইটের সিকিউরিটি প্লাগিন (যেমন: Wordfence বা Cloudflare) মিডিয়া আপলোড ব্লক করছে।");
     }
   }
 
   if (!response.ok) {
     let errorMsg = responseData?.message || `Media upload failed (Status: ${response.status})`;
-    if (!responseData) {
-      console.error("Media upload error (non-JSON):", responseText);
-      if (responseText.includes('<!doctype') || responseText.includes('<html')) {
-        errorMsg = "আপনার ওয়ার্ডপ্রেস সাইট থেকে ডেটার বদলে একটি এইচটিএমএল পেজ এসেছে। এটি সাধারণত সিকিউরিটি প্লাগিন বা ভুল ইউআরএল-এর কারণে হয়।";
-      }
+    if (!responseData && (responseText.includes('<!doctype') || responseText.includes('<html'))) {
+      errorMsg = "আপনার ওয়ার্ডপ্রেস সাইট থেকে ডেটার বদলে একটি এইচটিএমএল পেজ এসেছে। এটি সাধারণত সিকিউরিটি প্লাগিন বা ভুল ইউআরএল-এর কারণে হয়।";
     }
     throw new Error(errorMsg);
   }
@@ -139,7 +184,7 @@ export const uploadMedia = async (site: WPSite, file: File, metadata: MediaMetad
     return responseData.id;
   } else {
     console.error("Failed to parse media upload response as JSON. Content:", responseText);
-    throw new Error("সার্ভার থেকে সঠিক ফরম্যাটে উত্তর পাওয়া যায়নি। দয়া করে আবার চেষ্টা করুন।");
+    throw new Error("ইমেজ আপলোডের সঠিক রেসপন্স পাওয়া যায়নি।");
   }
 };
 
@@ -148,13 +193,13 @@ export const ensureTags = async (site: WPSite, tags: string[]): Promise<number[]
 
   for (const tagName of tags) {
     try {
-      const data = await wpProxy(site, '/wp-json/wp/v2/tags', 'POST', { name: tagName });
+      const data = await wpRequest(site, '/wp-json/wp/v2/tags', 'POST', { name: tagName });
       tagIds.push(data.id);
     } catch (e: any) {
       if (e.code === 'term_exists') {
         // Tag already exists, try to find its ID
         try {
-          const existingTags = await wpProxy(site, `/wp-json/wp/v2/tags?search=${encodeURIComponent(tagName)}`);
+          const existingTags = await wpRequest(site, `/wp-json/wp/v2/tags?search=${encodeURIComponent(tagName)}`);
           const exactMatch = existingTags.find((t: any) => t.name.toLowerCase() === tagName.toLowerCase());
           if (exactMatch) {
             tagIds.push(exactMatch.id);
@@ -232,7 +277,7 @@ export const publishToWP = async (
   if (article.tags && article.tags.length > 0) body.tags = article.tags;
   if (article.featuredMediaId) body.featured_media = article.featuredMediaId;
 
-  const data = await wpProxy(site, '/wp-json/wp/v2/posts', 'POST', body);
+  const data = await wpRequest(site, '/wp-json/wp/v2/posts', 'POST', body);
 
   return {
     link: data.link,

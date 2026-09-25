@@ -114,30 +114,201 @@ Schema:
   "tags": "tag1, tag2, tag3, tag4, tag5, tag6, tag7, tag8"
 }`;
 
-export const fetchAvailableModels = async (): Promise<Array<{ id: string; display_name: string; access_tier?: string }>> => {
+export const POPULAR_AI_MODELS = [
+  { id: "deepseek/deepseek-v4-flash", display_name: "DeepSeek V4 Flash (Fast & Recommended)" },
+  { id: "deepseek/deepseek-chat-v3.1", display_name: "DeepSeek Chat V3.1" },
+  { id: "deepseek/deepseek-v3.2", display_name: "DeepSeek V3.2" },
+  { id: "deepseek/deepseek-v4.1-flash:free", display_name: "DeepSeek V4.1 Flash (Free)" },
+  { id: "qwen/qwen3.5-flash:free", display_name: "Qwen 3.5 Flash (Free)" },
+  { id: "sensenova/sensenova-6.8-flash-lite", display_name: "SenseNova 6.8 Flash Lite" },
+  { id: "google/gemini-2.5-flash", display_name: "Gemini 2.5 Flash" }
+];
+
+/**
+ * Fetch available models directly from AI API, falling back to popular list on failure.
+ */
+export const fetchAvailableModels = async (
+  customBaseUrl?: string,
+  apiKey?: string
+): Promise<Array<{ id: string; display_name: string; access_tier?: string }>> => {
   try {
-    const res = await fetch("/api/ai-models");
+    let baseUrl = customBaseUrl;
+    let key = apiKey;
+
+    if (!baseUrl || !key) {
+      try {
+        const saved = localStorage.getItem("custom_ai_settings");
+        if (saved) {
+          const parsed = JSON.parse(saved);
+          baseUrl = baseUrl || parsed.baseUrl;
+          key = key || parsed.apiKey;
+        }
+      } catch (e) {
+        // ignore
+      }
+    }
+
+    const cleanBase = (baseUrl || DEFAULT_AI_SETTINGS.baseUrl).replace(/\/+$/, "");
+    const headers: Record<string, string> = { "Accept": "application/json" };
+    if (key?.trim()) {
+      headers["Authorization"] = `Bearer ${key.trim()}`;
+    }
+
+    const res = await fetch(`${cleanBase}/models`, {
+      method: "GET",
+      headers
+    });
+
     if (res.ok) {
       const data = await res.json();
       const list = data?.data || data?.models || [];
-      return list.map((m: any) => ({
-        id: m.id,
-        display_name: m.display_name || m.id,
-        access_tier: m.access_tier
-      }));
+      if (Array.isArray(list) && list.length > 0) {
+        return list.map((m: any) => ({
+          id: m.id,
+          display_name: m.display_name || m.id,
+          access_tier: m.access_tier
+        }));
+      }
     }
   } catch (e) {
-    console.warn("Could not fetch models", e);
+    console.warn("Could not fetch models directly from API, using popular list:", e);
   }
-  return [];
+
+  return POPULAR_AI_MODELS;
 };
 
+/**
+ * Helper to call OpenAI-compatible chat API directly from browser.
+ */
+async function callDirectChatApi(
+  endpoint: string,
+  apiKey: string,
+  model: string,
+  messages: any[],
+  temperature = 0.7,
+  max_tokens = 8192
+) {
+  const payload: any = {
+    model,
+    messages,
+    temperature,
+    max_tokens
+  };
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${apiKey.trim()}`,
+      "Content-Type": "application/json",
+      "Accept": "application/json"
+    },
+    body: JSON.stringify(payload)
+  });
+
+  const responseText = await response.text();
+  let data: any = null;
+  try {
+    data = responseText ? JSON.parse(responseText) : null;
+  } catch {
+    data = null;
+  }
+
+  return {
+    ok: response.ok,
+    status: response.status,
+    data,
+    rawText: responseText
+  };
+}
+
+/**
+ * Executes chat completions directly with smart retries (System prompt fallback & alternative model fallback).
+ */
+async function executeChatWithRetries(
+  baseUrl: string,
+  apiKey: string,
+  targetModel: string,
+  messages: any[],
+  temperature = 0.7,
+  max_tokens = 8192
+): Promise<{ data: any; notice?: string }> {
+  const cleanBaseUrl = (baseUrl || DEFAULT_AI_SETTINGS.baseUrl).replace(/\/+$/, "");
+  const endpoint = `${cleanBaseUrl}/chat/completions`;
+
+  // Attempt 1: Standard call
+  let res1 = await callDirectChatApi(endpoint, apiKey, targetModel, messages, temperature, max_tokens);
+  if (res1.ok && res1.data) {
+    return { data: res1.data };
+  }
+
+  console.warn(`Direct AI call attempt 1 failed (${res1.status}):`, res1.data || res1.rawText);
+
+  // Attempt 2: If 400 or 500 and system message exists, convert system role to user message
+  const hasSystemRole = messages && messages.some((m: any) => m.role === "system");
+  if (hasSystemRole) {
+    console.log("Attempt 2: Retrying with system message converted to user message...");
+    const convertedMessages = messages.map((m: any) => ({
+      role: m.role === "system" ? "user" : m.role,
+      content: m.role === "system" ? `[SYSTEM INSTRUCTIONS]\n${m.content}\n[END INSTRUCTIONS]` : m.content
+    }));
+
+    const res2 = await callDirectChatApi(endpoint, apiKey, targetModel, convertedMessages, temperature, max_tokens);
+    if (res2.ok && res2.data) {
+      return { data: res2.data };
+    }
+    console.warn("Attempt 2 with converted messages failed:", res2.status);
+  }
+
+  // Attempt 3: If 500 server error, try fallback models
+  if (res1.status === 500) {
+    const fallbackCandidates = [
+      "deepseek/deepseek-chat-v3.1",
+      "deepseek/deepseek-v3.2",
+      "deepseek/deepseek-v4.1-flash:free",
+      "qwen/qwen3.5-flash:free",
+      "sensenova/sensenova-6.8-flash-lite"
+    ].filter(m => m !== targetModel);
+
+    for (const fallbackModel of fallbackCandidates) {
+      try {
+        console.log(`Attempt 3: Trying fallback model: ${fallbackModel}...`);
+        const fallbackMessages = hasSystemRole ? messages.map((m: any) => ({
+          role: m.role === "system" ? "user" : m.role,
+          content: m.role === "system" ? `[SYSTEM INSTRUCTIONS]\n${m.content}\n[END INSTRUCTIONS]` : m.content
+        })) : messages;
+
+        const resFb = await callDirectChatApi(endpoint, apiKey, fallbackModel, fallbackMessages, temperature, max_tokens);
+        if (resFb.ok && resFb.data) {
+          return {
+            data: resFb.data,
+            notice: `Original model '${targetModel}' had server error. Automatically completed with '${fallbackModel}'.`
+          };
+        }
+      } catch (fbErr) {
+        console.warn(`Fallback ${fallbackModel} failed:`, fbErr);
+      }
+    }
+  }
+
+  // If all attempts failed, throw friendly error
+  const errMsg = res1.data?.error?.message || res1.data?.message || `HTTP ${res1.status}`;
+  if (res1.status === 401) {
+    throw new Error("আপনার xKiro API Key টি সঠিক নয় বা নিষ্ক্রিয়। অনুগ্রহ করে Settings থেকে সঠিক Key প্রদান করুন।");
+  }
+  if (res1.status === 500) {
+    throw new Error(`সার্ভার থেকে 500 Error এসেছে (সম্ভবত '${targetModel}' মডেলটি ওভারলোডেড)। অনুগ্রহ করে সেটিংস থেকে অন্য মডেল সিলেক্ট করুন। (${errMsg})`);
+  }
+
+  throw new Error(`AI API Error (${res1.status}): ${errMsg}`);
+}
+
 export const testAIConnection = async (settings: CustomAISettings): Promise<{ success: boolean; message: string }> => {
-  const apiKey = settings.apiKey?.trim();
+  const envKey = (import.meta as any).env?.VITE_XKIRO_API_KEY;
+  const apiKey = (settings.apiKey?.trim() || envKey?.trim());
   if (!apiKey) {
     return {
       success: false,
-      message: "API Key খালি রাখা যাবে না। xkiro.com থেকে key কপি করে পেস্ট করুন।"
+      message: "API Key খালি রাখা যাবে না। xkiro.com থেকে key কপি করে সেটিংসে পেস্ট করুন।"
     };
   }
 
@@ -145,41 +316,25 @@ export const testAIConnection = async (settings: CustomAISettings): Promise<{ su
   const model = (settings.model || DEFAULT_AI_SETTINGS.model).trim();
 
   try {
-    const response = await fetch("/api/ai-proxy", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        baseUrl,
-        apiKey,
-        model,
-        messages: [
-          { role: "user", content: "Reply with the single word: OK" }
-        ],
-        temperature: 0.2,
-        max_tokens: 150
-      })
-    });
-
-    const data = await response.json();
-
-    if (!response.ok) {
-      const errDetail = data?.error?.message || data?.message || `HTTP ${response.status}`;
-      return {
-        success: false,
-        message: `API সংযোগ ব্যর্থ: ${errDetail}`
-      };
-    }
+    const { data, notice } = await executeChatWithRetries(
+      baseUrl,
+      apiKey,
+      model,
+      [{ role: "user", content: "Reply with the single word: OK" }],
+      0.2,
+      150
+    );
 
     const reply = data?.choices?.[0]?.message?.content || "";
-    const notice = data?._fallbackNotice ? ` (${data._fallbackNotice})` : "";
+    const noticeText = notice ? ` (${notice})` : "";
     return {
       success: true,
-      message: `সফলভাবে সংযোগ হয়েছে! (Model: ${model}, Response: "${reply.trim()}")${notice}`
+      message: `সফলভাবে সংযোগ হয়েছে! (Model: ${model}, Response: "${reply.trim()}")${noticeText}`
     };
   } catch (err: any) {
     return {
       success: false,
-      message: `কানেকশন সমস্যা: ${err.message || 'Network error'}`
+      message: `কানেকশন সমস্যা: ${err.message || 'Network / CORS error'}`
     };
   }
 };
@@ -315,8 +470,6 @@ function repairJsonString(input: string): string {
  * Extracts fields using pattern matching when JSON structure is heavily broken or truncated.
  */
 function extractFieldsResiliently(raw: string, params: GenerationParams): GeneratedArticle {
-  const currentYear = new Date().getFullYear();
-
   // 1. Title extraction
   let title = "";
   const titleMatch = raw.match(/"title"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/);
@@ -341,22 +494,18 @@ function extractFieldsResiliently(raw: string, params: GenerationParams): Genera
 
   // 3. Content extraction
   let content = "";
-  // Look for "content": "..."
   const contentIdx = raw.search(/"content"\s*:\s*"/);
   if (contentIdx !== -1) {
     const afterQuoteIdx = raw.indexOf('"', contentIdx + 10) + 1;
-    // Find where content ends: usually before next top-level key or end of JSON
     const nextKeyMatch = raw.slice(afterQuoteIdx).match(/",\s*"(?:slug|yoast_seo|image_seo|tags)"/);
     if (nextKeyMatch && nextKeyMatch.index !== undefined) {
       content = raw.slice(afterQuoteIdx, afterQuoteIdx + nextKeyMatch.index);
     } else {
-      // Check for closing quote followed by closing brace
       const endBraceIdx = raw.lastIndexOf('}');
       const endQuoteIdx = raw.lastIndexOf('"', endBraceIdx > 0 ? endBraceIdx - 1 : raw.length - 1);
       if (endQuoteIdx > afterQuoteIdx) {
         content = raw.slice(afterQuoteIdx, endQuoteIdx);
       } else {
-        // Output was truncated mid-content! Take everything till end
         content = raw.slice(afterQuoteIdx);
       }
     }
@@ -365,7 +514,6 @@ function extractFieldsResiliently(raw: string, params: GenerationParams): Genera
 
   // If content still empty or too short, check if raw string itself is markdown
   if (!content || content.length < 100) {
-    // If the entire text contains markdown headers, use the raw markdown
     const mdStart = raw.indexOf("# ");
     if (mdStart !== -1) {
       content = raw.substring(mdStart).replace(/```\s*$/g, "").trim();
@@ -399,7 +547,6 @@ function extractFieldsResiliently(raw: string, params: GenerationParams): Genera
   const metaDescMatch = raw.match(/"meta_desc"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/);
   if (metaDescMatch) metaDesc = cleanEscapes(metaDescMatch[1]);
   else {
-    // Generate a fallback meta description from intro
     metaDesc = `${title} সম্পর্কে বিস্তারিত জেনে নিন। ${focusKeyword} সম্পর্কিত প্রয়োজনীয় সকল তথ্য এখানে ধাপে ধাপে আলোচনা করা হয়েছে।`;
   }
 
@@ -482,7 +629,8 @@ export const generateSEOArticle = async (
     }
   }
 
-  const apiKey = settings?.apiKey?.trim();
+  const envKey = (import.meta as any).env?.VITE_XKIRO_API_KEY;
+  const apiKey = (settings?.apiKey?.trim() || envKey?.trim());
   if (!apiKey) {
     throw new Error(
       params.language === 'en'
@@ -552,25 +700,14 @@ CRITICAL FORMATTING INSTRUCTIONS:
   ];
 
   try {
-    const response = await fetch("/api/ai-proxy", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        baseUrl,
-        apiKey,
-        model,
-        messages,
-        temperature: 0.7,
-        max_tokens: 8192
-      })
-    });
-
-    const data = await response.json();
-
-    if (!response.ok) {
-      const errMsg = data?.error?.message || data?.message || `HTTP ${response.status}`;
-      throw new Error(`AI API Error: ${errMsg}`);
-    }
+    const { data } = await executeChatWithRetries(
+      baseUrl,
+      apiKey,
+      model,
+      messages,
+      0.7,
+      8192
+    );
 
     const rawContent = data?.choices?.[0]?.message?.content || "";
     if (!rawContent) {
