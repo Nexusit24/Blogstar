@@ -1,0 +1,22 @@
+@import url('https://fonts.maateen.me/solaiman-lipi/font.css');
+@import url('https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@300;400;500;600;700&family=Noto+Sans+Bengali:wght@300;400;500;600;700&display=swap');
+
+:root {
+  --font-bengali: 'SolaimanLipi', 'Hind Siliguri', 'Noto Sans Bengali', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+
+body, button, input, select, textarea, p, h1, h2, h3, h4, h5, h6, span, div, label {
+  font-family: var(--font-bengali);
+}
+
+/* Custom styling for rendered markdown content */
+.prose h1, .prose h2, .prose h3, .prose h4 {
+  font-family: var(--font-bengali);
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+.prose p, .prose li {
+  font-family: var(--font-bengali);
+  line-height: 1.8;
+}
